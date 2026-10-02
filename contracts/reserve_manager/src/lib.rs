@@ -236,15 +236,22 @@ impl ReserveManager {
     /// One-time setup. `governance` is the only address permitted to call
     /// `set_min_reserve` and the handover entrypoints.
     ///
-    /// Requires governance auth so a third party cannot initialise the
-    /// contract with an address they do not control.
+    /// Does not require `governance`'s own auth: governance is typically a
+    /// contract address (a DAO/voting contract) with no `__check_auth`, so
+    /// requiring its signature here would make every real deployment fail
+    /// (see the deploy script, which passes the governance contract's
+    /// address while signing as the deployer). This matches the sibling
+    /// `pol_vesting`/`incentive_campaigns` contracts, which initialize the
+    /// same way. The one-time `AlreadyInitialized` guard below is the only
+    /// protection against re-initialization; whoever can call this contract
+    /// before the deploy script does controls the initial governance
+    /// address, same as those sibling contracts.
     pub fn initialize(
         env: Env,
         governance: Address,
         factory: Address,
     ) -> Result<(), ReserveManagerError> {
         Self::extend_instance_ttl(&env);
-        governance.require_auth();
         if env.storage().instance().has(&DataKey::Governance) {
             return Err(ReserveManagerError::AlreadyInitialized);
         }
@@ -269,23 +276,37 @@ impl ReserveManager {
         current_governance: Address,
         new_governance: Address,
     ) -> Result<(), ReserveManagerError> {
-        Self::extend_instance_ttl(&env);
-        if Self::is_paused(env.clone()) {
-            return Err(ReserveManagerError::Paused);
-        }
-        let stored: Address = env.storage().instance().get(&DataKey::Governance).unwrap();
-        if current_governance != stored {
-            return Err(ReserveManagerError::Unauthorized);
-        }
-        stored.require_auth();
-        env.storage()
-            .instance()
-            .set(&DataKey::PendingGovernance, &Some(new_governance.clone()));
+        Self::do_propose_governance(&env, current_governance.clone(), new_governance.clone())?;
         emit_versioned_event!(
             env,
             (Symbol::new(&env, "governance_proposed"),),
             (current_governance, new_governance)
         );
+        Ok(())
+    }
+
+    /// Shared implementation behind `propose_governance`/`propose_admin`:
+    /// both nominate the next holder of the single governance role and
+    /// differ only in which event they emit. Keeping one implementation
+    /// means a change to this logic can't silently diverge between the two
+    /// public entrypoints.
+    fn do_propose_governance(
+        env: &Env,
+        current: Address,
+        new_governance: Address,
+    ) -> Result<(), ReserveManagerError> {
+        Self::extend_instance_ttl(env);
+        if Self::is_paused(env.clone()) {
+            return Err(ReserveManagerError::Paused);
+        }
+        let stored: Address = env.storage().instance().get(&DataKey::Governance).unwrap();
+        if current != stored {
+            return Err(ReserveManagerError::Unauthorized);
+        }
+        stored.require_auth();
+        env.storage()
+            .instance()
+            .set(&DataKey::PendingGovernance, &Some(new_governance));
         Ok(())
     }
 
@@ -295,7 +316,22 @@ impl ReserveManager {
     /// transaction. On success the stored governance is updated, the pending
     /// nominee is cleared, and a `governance_transferred` event is emitted.
     pub fn accept_governance(env: Env, new_governance: Address) -> Result<(), ReserveManagerError> {
-        Self::extend_instance_ttl(&env);
+        Self::do_accept_governance(&env, new_governance.clone())?;
+        emit_versioned_event!(
+            env,
+            (Symbol::new(&env, "governance_transferred"),),
+            (new_governance,)
+        );
+        Ok(())
+    }
+
+    /// Shared implementation behind `accept_governance`/`accept_admin`: both
+    /// complete the handover of the single governance role, differing only
+    /// in which event they emit and (for `accept_admin`, which maps this
+    /// function's generic errors to its own variants) which error type they
+    /// surface.
+    fn do_accept_governance(env: &Env, new_governance: Address) -> Result<(), ReserveManagerError> {
+        Self::extend_instance_ttl(env);
         if Self::is_paused(env.clone()) {
             return Err(ReserveManagerError::Paused);
         }
@@ -315,11 +351,6 @@ impl ReserveManager {
         env.storage()
             .instance()
             .set(&DataKey::PendingGovernance, &Option::<Address>::None);
-        emit_versioned_event!(
-            env,
-            (Symbol::new(&env, "governance_transferred"),),
-            (new_governance,)
-        );
         Ok(())
     }
 
@@ -355,26 +386,18 @@ impl ReserveManager {
             .unwrap_or(false)
     }
 
-    /// Nominate a new admin. Thin alias over [`Self::propose_governance`]:
-    /// reads/writes the same single role and pending-nominee keys, so a
-    /// rotated-out governance cannot retain a separate admin authority.
+    /// Nominate a new admin. Delegates to the same implementation
+    /// `propose_governance` uses — admin and governance are one role — and
+    /// emits `admin_nominated` instead of `governance_proposed` so
+    /// integrators using the admin vocabulary keep seeing the event they
+    /// expect. A future change to the shared propose logic can't diverge
+    /// between the two entrypoints, since there is only one implementation.
     pub fn propose_admin(
         env: Env,
         admin: Address,
         new_admin: Address,
     ) -> Result<(), ReserveManagerError> {
-        Self::extend_instance_ttl(&env);
-        if Self::is_paused(env.clone()) {
-            return Err(ReserveManagerError::Paused);
-        }
-        let stored: Address = env.storage().instance().get(&DataKey::Governance).unwrap();
-        if admin != stored {
-            return Err(ReserveManagerError::Unauthorized);
-        }
-        admin.require_auth();
-        env.storage()
-            .instance()
-            .set(&DataKey::PendingGovernance, &Some(new_admin.clone()));
+        Self::do_propose_governance(&env, admin.clone(), new_admin.clone())?;
         emit_versioned_event!(
             env,
             (Symbol::new(&env, "admin_nominated"),),
@@ -383,35 +406,18 @@ impl ReserveManager {
         Ok(())
     }
 
-    /// Accept the pending admin nomination. Thin alias over
-    /// [`Self::accept_governance`]: sets [`DataKey::Governance`] and clears
-    /// [`DataKey::PendingGovernance`], the same keys the governance path uses.
+    /// Accept the pending admin nomination. Delegates to the same
+    /// implementation `accept_governance` uses, translating its generic
+    /// error variants to the admin-specific ones the public API has always
+    /// returned, and emits `admin_changed` instead of
+    /// `governance_transferred`.
     pub fn accept_admin(env: Env, new_admin: Address) -> Result<(), ReserveManagerError> {
-        Self::extend_instance_ttl(&env);
-        if Self::is_paused(env.clone()) {
-            return Err(ReserveManagerError::Paused);
-        }
-        let pending: Option<Address> = env
-            .storage()
-            .instance()
-            .get(&DataKey::PendingGovernance)
-            .unwrap_or(None);
-        let nominee = pending.ok_or(ReserveManagerError::NoPendingAdmin)?;
-        if new_admin != nominee {
-            return Err(ReserveManagerError::WrongAdmin);
-        }
-        new_admin.require_auth();
-        env.storage()
-            .instance()
-            .set(&DataKey::Governance, &new_admin);
-        env.storage()
-            .instance()
-            .set(&DataKey::PendingGovernance, &Option::<Address>::None);
-        emit_versioned_event!(
-            env,
-            (Symbol::new(&env, "admin_changed"),),
-            (new_admin,)
-        );
+        Self::do_accept_governance(&env, new_admin.clone()).map_err(|e| match e {
+            ReserveManagerError::NoPendingGovernance => ReserveManagerError::NoPendingAdmin,
+            ReserveManagerError::Unauthorized => ReserveManagerError::WrongAdmin,
+            other => other,
+        })?;
+        emit_versioned_event!(env, (Symbol::new(&env, "admin_changed"),), (new_admin,));
         Ok(())
     }
 
@@ -2021,7 +2027,8 @@ mod tests {
         // A legacy instance-storage entry is migrated to persistent on first touch.
         let cl_key = DataKey::PoolKind(cl.clone());
         s.env.as_contract(&s.rm_addr, || {
-            s.env.storage()
+            s.env
+                .storage()
                 .instance()
                 .set(&cl_key, &PoolKind::ConcentratedLiquidity);
             assert!(!s.env.storage().persistent().has(&cl_key));
@@ -2040,15 +2047,20 @@ mod tests {
 
     /// initialize must require governance auth.
     #[test]
-    fn test_initialize_requires_auth() {
+    fn test_initialize_does_not_require_governance_auth() {
+        // governance is typically a contract address (a DAO/voting contract)
+        // with no __check_auth, so initialize must not demand its signature
+        // — only the one-time AlreadyInitialized guard protects it. Calling
+        // this with no mock_all_auths at all pins that regression: if
+        // initialize ever required any address's auth again, this would
+        // fail with no mocked auths in scope.
         let env = Env::default();
         let gov = Address::generate(&env);
         let factory = Address::generate(&env);
         let rm_addr = env.register_contract(None, ReserveManager);
         let rm = ReserveManagerClient::new(&env, &rm_addr);
 
-        // No mock_all_auths: governance.require_auth() must reject the call.
-        assert!(rm.try_initialize(&gov, &factory).is_err());
+        assert!(rm.try_initialize(&gov, &factory).is_ok());
     }
 
     /// res_warn payload: version-stamped, lists only unhealthy pools, and
